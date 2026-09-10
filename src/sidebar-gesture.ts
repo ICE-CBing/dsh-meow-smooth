@@ -10,7 +10,12 @@
  *  - 左缘向右长划（≥110px）→ 跳过细条直接打开宽边栏
  *  - 宽边栏在场：边栏无按钮空白处向左滑，或右侧窗口向左滑 → 收起到 0
  *  - 细条在场：右侧窗口向左滑 → 收起到 0
- *  - 点右侧窗口区收起（client.ts onClickDismissSidebar，行为一致）
+ *  - 轻点（tap）右侧窗口区收起（v6.3 新增，详见 onTouchEnd tap 分支注释：
+ *    不能只依赖 client.ts 的 click 收起——第三方插件的画布/手势面常在
+ *    touchstart 上 preventDefault，浏览器对被取消的 touch 序列不再派生
+ *    click，那些表面永远收不到 click 事件）
+ *  - 点右侧窗口区收起（client.ts onClickDismissSidebar，行为一致；作为
+ *    鼠标路径与普通表面的兜底，两者经"0 档无事可做"早退天然去重）
  *
  * 三档停留态全部是官方原生状态：
  *  - 0     = furl 收起（小方块，功能⑱ 原样，零改动）
@@ -35,6 +40,11 @@ const SWIPE_MIN = 24
 const LONG_SWIPE = 110
 /** 横向主导判定系数：|dx| > |dy| × 此值才算横滑。 */
 const AXIS_RATIO = 1.2
+/** 轻点判定：起手后累计位移 ≤ 此值、且时长 ≤ TAP_MAX_MS 才算 tap
+ *  （位移超过=滚动手势起点；时长超过=长按拖拽语义，如 femwa 画布 200ms
+ *  即转入节点拖拽/画布平移，绝不能替用户收边栏）。 */
+const TAP_SLOP = 12
+const TAP_MAX_MS = 300
 
 /** 手势模块依赖（client.ts apply 注入既有工具函数，避免重复实现）。 */
 export interface GestureDeps {
@@ -88,7 +98,7 @@ export function installSidebarGesture(deps: GestureDeps): GestureApi {
   // 运行时构建标记（排障用）：页面执行到本函数即可见，用于确认"页面
   // 实际执行的 client.js 是否为本构建"（rev 滞后时静态路由与执行内容
   // 不一致——排障期每次构建必须 bump 标记文本并等精确匹配）。
-  document.documentElement.dataset.meowSmoothGestureLoaded = 'v6.2-axis'
+  document.documentElement.dataset.meowSmoothGestureLoaded = 'v6.3-tap'
   const w = window as unknown as Record<string, unknown>
   // 旧实例清理：dsh 模块热替换（rev 更新）会执行新脚本，但旧实例挂在
   // document 上的匿名监听器无法自动移除——新旧实例并存时互相污染状态。
@@ -107,6 +117,8 @@ export function installSidebarGesture(deps: GestureDeps): GestureApi {
   let phase: 'idle' | 'pending' | 'committed' = 'idle'
   let sx = 0
   let sy = 0
+  /** pending 起手时刻（tap 时长判定用，见 TAP_MAX_MS）。 */
+  let sT = 0
   /** 起手区域：furl 态左缘 / rail 表面 / 展开态表面 / 右侧窗口。 */
   let startZone: 'edge' | 'rail' | 'sidebar' | 'window' = 'window'
   /** 窄档停留保持（见 GestureApi.narrowHold）。挂 window 使热替换新实例
@@ -173,6 +185,7 @@ export function installSidebarGesture(deps: GestureDeps): GestureApi {
     const touch = event.touches[0]
     sx = touch.clientX
     sy = touch.clientY
+    sT = performance.now()
     const onInput = target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement
     if (onInput && sx > EDGE_HOTSPOT) return
     // composer 卡片内起手一律排除（2026-08-25 光标 bug）：旧版留了"卡片内
@@ -180,7 +193,13 @@ export function installSidebarGesture(deps: GestureDeps): GestureApi {
     // 的起手极易落进这 26px 条带，pending 态横移被 committed+preventDefault
     // 冻住光标。输入区永不参与边栏手势；furl 态拉边栏走屏幕其余左缘。
     if (target.closest('[data-composer-card]') !== null) return
-    const overlayHit = target.closest('[role="dialog"], [data-meow-smooth-pending], [data-meow-smooth-fab]')
+    // 弹层（菜单/命令面板/审批卡片/overlay）起手不参与手势，也不做 tap 收起
+    // ——与 client.ts onClickDismissSidebar 的排除面一致（v6.3 从仅 dialog
+    // 扩到全量：tap 收起语义进场后，菜单内轻点绝不能替用户收边栏）。
+    const overlayHit = target.closest(
+      '[role="dialog"], [role="menu"], [role="menuitem"], [role="listbox"], [role="option"], '
+      + '[data-shell-overlay], [data-meow-smooth-pending], [data-meow-smooth-fab]',
+    )
     if (overlayHit !== null) return
 
     if (!collapsedNow()) {
@@ -242,7 +261,29 @@ export function installSidebarGesture(deps: GestureDeps): GestureApi {
   // --- 松手：按累计位移分派动作 ---
   const onTouchEnd = (event: TouchEvent): void => {
     if (phase !== 'committed') {
+      // 轻点外部收起（v6.3，猫猫定稿"点侧边栏外面一律收回"）：pending 态
+      // 原地松手 = tap。起手在"侧边栏外部的窗口区"（startZone=window，仅
+      // 侧边栏在场时会置）且位移/时长都是 tap 量级 → 收起到 0 档。
+      //
+      // 为什么必须走 touch 而不能只靠 client.ts 的 click 收起：第三方插件
+      // 常在自家表面的 touchstart 上 preventDefault（femwa 剧本画布为掐灭
+      // 安卓长按选字即如此）——浏览器对被取消的 touch 序列不再派生任何鼠
+      // 标事件，click 永远不来，onClickDismissSidebar 对那些表面失明。本
+      // 模块的 document 级 touch 监听是 passive 捕获，不受影响，是唯一可
+      // 靠通道。与 click 路径的去重：本分支先收到 0 档，随后到达的 click
+      // 命中 onClickDismissSidebar 的"collapsed+furled=无事可做"早退。
+      // touchcancel（浏览器接管）不算 tap。
+      const tap = phase === 'pending' && startZone === 'window' && event.type !== 'touchcancel'
       phase = 'idle'
+      if (tap) {
+        const touch = event.changedTouches[0]
+        const dx = (touch?.clientX ?? sx) - sx
+        const dy = (touch?.clientY ?? sy) - sy
+        if (Math.hypot(dx, dy) <= TAP_SLOP && performance.now() - sT <= TAP_MAX_MS) {
+          note(`tap-dismiss dx=${Math.round(dx)} dy=${Math.round(dy)} ms=${Math.round(performance.now() - sT)}`)
+          collapseToZero()
+        }
+      }
       return
     }
     phase = 'idle'

@@ -2115,7 +2115,12 @@ function installPendingBanner(
  *  maybeCollapseSidebar 保证：宽屏/已收起直接 return，页面加载时窄屏
  *  默认收起也无害——只有"窄屏 + 用户展开"时才会真正收起。 */
 export interface FoldDockProps {
-  session: { sessionId: SessionId }
+  /** 【0.1.3 兼容】旧版（rc.2）owner props 携带 session；0.1.3 把 dock 槽改为
+   *  session scope（owner 传空对象），sessionId 走 session 标准 props 直接到达。
+   *  两形都收，谁在用谁生效。 */
+  session?: { sessionId: SessionId }
+  /** 0.1.3 session scope 标准 props（BUILTIN_SOURCE）。 */
+  sessionId?: SessionId
   /** 会话切换回调（apply 闭包注入：窄屏+展开时收起侧边栏）。 */
   onSessionSwitch: () => void
   /** 本地 pending 汇报回调（apply 闭包注入 → 横幅模块）。 */
@@ -2125,7 +2130,11 @@ export interface FoldDockProps {
   useSessions: <T>(selector: (snapshot: unknown) => T) => T
 }
 
-export function FoldDock({ session, onSessionSwitch, reportPending, useSessions }: FoldDockProps): null {
+export function FoldDock({ session, sessionId: sessionIdProp, onSessionSwitch, reportPending, useSessions }: FoldDockProps): null {
+  const sessionId = sessionIdProp ?? session?.sessionId
+  // 0.1.3 owner 不再携带 session；标准 props 缺失（理论不发生）时静默退出，
+  // 绝不抛错——dock 条目一崩，femGen 的运行/pending 状态展示链路全断。
+  if (sessionId === undefined) return null
   // 需求⑳：会话切换后撤掉自动聚焦——触屏上弹键盘很碍眼。
   // 官方 unlock effect 在 mount/session 切换时无条件 focus textarea；
   // 这里在 sessionId 变化后延迟检查并撤焦（setTimeout 确保 React effects
@@ -2139,11 +2148,11 @@ export function FoldDock({ session, onSessionSwitch, reportPending, useSessions 
       }
     }, 50)
     return () => window.clearTimeout(timer)
-  }, [session.sessionId])
+  }, [sessionId])
 
   useEffect(() => {
     onSessionSwitch()
-  }, [session.sessionId, onSessionSwitch])
+  }, [sessionId, onSessionSwitch])
   // 跨会话 pending 汇报（需求 12/13）：manager 对所有会话跟踪
   // pendingInteraction（含未实例化会话），官方帧到达即有。审批细节由
   // host 轮询补（toolName/reason/命令），这里只报状态与标题。
@@ -2159,8 +2168,8 @@ export function FoldDock({ session, onSessionSwitch, reportPending, useSessions 
       }))
   })
   useEffect(() => {
-    reportPending(pendingItems, session.sessionId)
-  }, [pendingItems, session.sessionId, reportPending])
+    reportPending(pendingItems, sessionId)
+  }, [pendingItems, sessionId, reportPending])
   return null
 }
 
@@ -2391,7 +2400,10 @@ export function apply(ctx: any): void {
   syncSidebarFurl()
   const sessions = ctx?.sessions as { open?: (sessionId: string) => void; refresh?: () => Promise<void> } | undefined
   // 手机端：侧边栏展开时点击右侧空间 → 自动收起（click 而非 pointerdown，
-  // 见 onClickDismissSidebar 注释）。
+  // 见 onClickDismissSidebar 注释）。v6.3 起触摸 tap 由手势模块补位收起
+  // （sidebar-gesture onTouchEnd tap 分支）：touchstart 被 preventDefault
+  // 的插件表面（femwa 画布等）浏览器不再派生 click，本监听对它们失明；
+  // 两路径经"0 档无事可做"早退天然去重。
   const onDismissClick = (event: MouseEvent): void => { onClickDismissSidebar(event, layout) }
   document.addEventListener('click', onDismissClick, { capture: true })
   disposers.push(() => { document.removeEventListener('click', onDismissClick, { capture: true }) })
