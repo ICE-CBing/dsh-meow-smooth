@@ -101,7 +101,9 @@ export interface Config extends Record<string, any> {
    *  targetPort 自动从 dsh --port 解析。开启后把 tailscale serve 等反代
    *  指向 127.0.0.1:<port>。零 dsh 本体改动，见 src/compress-proxy.ts。
    *  版本自适应：旧版 dsh 以 gzip 模式运行（现状）；dsh 0.1.2+ 官方已
-   *  内置 gzip，启动时自动探测并降级为纯透传（无需改任何配置）。 */
+   *  内置 gzip，启动时自动探测并降级为纯透传（无需改任何配置）。
+   *  探测走本插件自注册的 /plugins/meow-smooth/pending（新旧版都在），
+   *  不再依赖 0.1.5 起已 404 的 /plugins/<id>/client.js，见 compress-proxy.ts。 */
   proxy?: {
     enabled?: boolean
     port?: number
@@ -130,6 +132,7 @@ export function apply(ctx: any, config?: Config): void {
   // 历史完全一致），随后异步探测官方 gzip（dsh 0.1.2+ webserver 内置）——
   // 探测到即 setMode('passthrough') 切纯透传（同一 server，零断流），
   // tailscale serve 指向无需变动；探测不到保持 gzip 模式（保守回退）。
+  // 探测路径本身跨版本存活（见 compress-proxy.ts 的 GZIP_PROBE_PATHS）。
   const proxyCfg = config?.proxy
   if (proxyCfg?.enabled === true) {
     const targetPort = proxyCfg.targetPort ?? resolveTargetPort()

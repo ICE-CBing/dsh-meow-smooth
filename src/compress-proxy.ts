@@ -22,6 +22,7 @@
  */
 
 import http from 'node:http'
+import net from 'node:net'
 import zlib from 'node:zlib'
 
 /** 压缩代理运行模式：gzip=对 unary /api/* JSON 压缩（旧版 dsh）；
@@ -93,6 +94,12 @@ export function startCompressProxy(options: CompressProxyOptions): {
       },
     )
     upstream.on('error', (error) => {
+      // headersSent 之后再 writeHead 会 throw ERR_HTTP_HEADERS_SENT（响应
+      // 中途上游断开时复现，进程级致命）：已开始响应只能掐掉这条连接。
+      if (res.headersSent) {
+        res.destroy()
+        return
+      }
       res.writeHead(502, { 'content-type': 'text/plain' })
       res.end(`meow-smooth compress-proxy: upstream error: ${error.message}`)
     })
@@ -100,7 +107,20 @@ export function startCompressProxy(options: CompressProxyOptions): {
   })
 
   // WebSocket upgrade 透传（双向 pipe；dsh 前端用 WS 连 events.mux/host）。
+  // 隧道两侧是裸 socket，必须一进来就挂错误兜底（2026-09-02 实锤的总闪退
+  // 根因）：任一端被 RST（手机 PWA 被挂起/切网、页面刷新后的旧连接心跳、
+  // dsh 热重载 closeAllConnections 主动断升级 socket）都会抛 ECONNRESET——
+  // 本代理跑在 dsh 进程内，无人监听时 Node 直接杀死整个 dsh。降级语义：
+  // 错误/断开 = 这条隧道作废，两端联动销毁，仅记日志，进程无恙。
+  // （正常关闭的 FIN 已由 pipe 双向传播，无需额外处理；这里只兜异常。）
   server.on('upgrade', (req, socket, head) => {
+    let upSocket: net.Socket | undefined
+    const teardown = (origin: string) => (error: Error): void => {
+      console.warn(`[meow-smooth] compress proxy tunnel dropped (${origin}): ${error.message}`)
+      socket.destroy()
+      upSocket?.destroy()
+    }
+    socket.on('error', teardown('browser'))
     const upstream = http.request({
       host: '127.0.0.1',
       port: targetPort,
@@ -110,7 +130,9 @@ export function startCompressProxy(options: CompressProxyOptions): {
       // connection，不显式传会把 Upgrade 请求降级成普通请求（上游 426）。
       headers: { ...req.headers, connection: 'Upgrade', upgrade: 'websocket' },
     })
-    upstream.on('upgrade', (upRes, upSocket, upHead) => {
+    upstream.on('upgrade', (upRes, upSock, upHead) => {
+      upSocket = upSock
+      upSocket.on('error', teardown('dsh'))
       socket.write(`HTTP/1.1 101 Switching Protocols\r\n${
         Object.entries(upRes.headers).map(([key, value]) => `${key}: ${value}`).join('\r\n')
       }\r\n\r\n`)
@@ -150,16 +172,50 @@ export function startCompressProxy(options: CompressProxyOptions): {
 }
 
 /**
+ * 官方 gzip 探测的候选路径，按"跨版本存活度"排序：
+ *
+ *  1. `/plugins/meow-smooth/pending` —— 本插件 apply 内自注册的只读路由，
+ *     所有版本一律存在，且实测能区分压缩能力：
+ *       · dsh ≤0.1.1（3080/3081 实测）→ 200 且无 content-encoding
+ *       · dsh 0.1.5-rc.1（2026-09-10 实测）→ 200 + content-encoding: gzip
+ *  2. `/plugins/meow-smooth/client.js` —— 旧版 dsh 由本体提供的静态资源路由。
+ *     注意：0.1.5 起客户端模块改为组合 URL `/plugins/??<id>/client.js,…&rev=…`，
+ *     本路径已 404（2026-09-10 实测），故只能作备用候选，不可再作唯一依据——
+ *     旧实现只用它，在新版上必然探测失败、误判为旧版而放弃 passthrough 降级。
+ */
+export const GZIP_PROBE_PATHS: readonly string[] = [
+  '/plugins/meow-smooth/pending',
+  '/plugins/meow-smooth/client.js',
+]
+
+/** 单路径探测：200+gzip → 'gzip'；200 未压缩 → 'plain'；其余 → 'unready'（可重试）。 */
+async function probeCompression(targetPort: number, path: string): Promise<'gzip' | 'plain' | 'unready'> {
+  return await new Promise<'gzip' | 'plain' | 'unready'>((resolve) => {
+    const req = http.get(
+      { host: '127.0.0.1', port: targetPort, path, headers: { 'accept-encoding': 'gzip' } },
+      (res) => {
+        res.resume()
+        if (res.statusCode !== 200) { resolve('unready'); return }
+        resolve(res.headers['content-encoding'] === 'gzip' ? 'gzip' : 'plain')
+      },
+    )
+    req.setTimeout(1000, () => { req.destroy(new Error('detect timeout')); })
+    req.on('error', () => resolve('unready'))
+  })
+}
+
+/**
  * 探测 dsh 本体是否已内置响应压缩（0.1.2+ webserver compression:'gzip'）。
  *
- * 方法：对本体的公开路由 /plugins/meow-smooth/client.js 发带
- * Accept-Encoding: gzip 的 GET，看响应 content-encoding 是否为 gzip——
- * 直接测实际行为而非解析版本号，官方压缩被配置关闭时也能正确回退。
- * 该路由由本插件 apply 内同步注册，探测异步进行必然晚于注册。
+ * 方法：对本体路由发带 Accept-Encoding: gzip 的 GET，看响应 content-encoding
+ * 是否为 gzip——直接测实际行为而非解析版本号，官方压缩被配置关闭时也能正确
+ * 回退；`$DSH_HOME`/端口/装配方式都不参与判定，因此对新旧版本一视同仁。
+ * 候选路径见 {@link GZIP_PROBE_PATHS}（插件自注册路由优先，静态路由兜底）。
  *
- * 判定：200 + content-encoding: gzip → true；200 且未压缩 → false
- * （定论，毫秒级返回）；404/5xx/连接拒绝/超时 → 重试，耗尽后返回
- * false（保守按旧版处理——误判方向的代价是多一层无损透传而非断网）。
+ * 判定：任一候选 200 + content-encoding: gzip → true（定论，毫秒级返回）；
+ *      无候选给出 gzip 但至少一个候选 200 未压缩 → false（定论）；
+ *      全部候选 404/5xx/连接拒绝/超时 → 重试，耗尽后返回 false
+ *      （保守按旧版处理——误判方向的代价是多一层无损透传而非断网）。
  *
  * @param targetPort - dsh 本体端口。
  * @param attempts - 最大尝试次数（默认 6）。
@@ -169,20 +225,14 @@ export function startCompressProxy(options: CompressProxyOptions): {
 export async function detectOfficialGzip(targetPort: number, attempts = 6, delayMs = 150): Promise<boolean> {
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, delayMs))
-    const verdict = await new Promise<'gzip' | 'plain' | 'unready'>((resolve) => {
-      const req = http.get(
-        { host: '127.0.0.1', port: targetPort, path: '/plugins/meow-smooth/client.js', headers: { 'accept-encoding': 'gzip' } },
-        (res) => {
-          res.resume()
-          if (res.statusCode !== 200) { resolve('unready'); return }
-          resolve(res.headers['content-encoding'] === 'gzip' ? 'gzip' : 'plain')
-        },
-      )
-      req.setTimeout(1000, () => { req.destroy(new Error('detect timeout')); })
-      req.on('error', () => resolve('unready'))
-    })
-    if (verdict === 'gzip') return true
-    if (verdict === 'plain') return false
+    let sawPlain = false
+    for (const path of GZIP_PROBE_PATHS) {
+      const verdict = await probeCompression(targetPort, path)
+      if (verdict === 'gzip') return true
+      if (verdict === 'plain') sawPlain = true
+    }
+    // 有明确"未压缩"的答复即可定论为旧版；全部候选都不可用才重试。
+    if (sawPlain) return false
   }
   return false
 }
