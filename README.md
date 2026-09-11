@@ -104,6 +104,8 @@ dsh plugin --profile web remove meow-smooth
 
 `scripts/feishu-relay.mjs` 是一个零依赖的转发进程——接收插件发出的 Bark 形状报文，构造成飞书 interactive 卡片（按事件类型配色：待审批橙、待回答蓝、完成绿、失败红、启动青），签名后投递到群机器人的 webhook。
 
+> **先把脚本放到你自己的目录。** 下面的命令假定你就在一个含 `scripts/` 的目录里。若你是从 npm 或 `dsh plugin add github:…` 安装的，文件在 `<profile>/node_modules/meow-smooth/scripts/` 下——请先把 `feishu-relay.mjs` 与 `feishu-relay.config.example.json` 复制到一个你自有的稳定目录再运行。脚本把配置与日志都写在**它自己所在的目录**，直接在 `node_modules` 里跑的话，重装一次就全丢了。
+
 1. 复制配置样例，填入群机器人的 webhook 地址（`secret` 只在飞书侧开了「签名校验」时才需要）：
 
    ```sh
