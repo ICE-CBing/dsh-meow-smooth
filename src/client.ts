@@ -613,6 +613,39 @@ html[${IME_ROOT_ATTR}] [${FAB_ATTR}] {
   width: 16px;
   height: 16px;
 }
+
+/* 手机端拍/选图按钮（仅 dsh ≤0.1.2：0.1.3-alpha.2 起官方自带 📎，探测到就
+   不渲染，见 photo-picker.tsx）。外观对齐官方输入栏那组图标按钮（.add 契约：
+   28px 圆形 + 透明底 + 次要色 + hover 浅底 + focus 描边）。 */
+[data-meow-photo-picker] {
+  display: grid;
+  place-items: center;
+  flex: none;
+  corner-shape: round;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  transition: background-color 100ms ease;
+  padding: 0;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+[data-meow-photo-picker]:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+[data-meow-photo-picker]:focus-visible {
+  outline: 2px solid var(--dsw-alias-label-tertiary);
+  outline-offset: -2px;
+}
+[data-meow-photo-picker] svg {
+  width: 16px;
+  height: 16px;
+}
 `
 
 /** 每个滚动窗折叠前的 scrollTop（展开时恢复，防视口错位）。 */
