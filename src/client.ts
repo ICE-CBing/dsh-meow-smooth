@@ -143,6 +143,7 @@ import { installNotifyClient, type NotifyItem } from './notify-client.ts'
 import { installSettingsMobile } from './settings-mobile.ts'
 import { installSidebarGesture } from './sidebar-gesture.ts'
 import { createBusyEnterHook, RunSendButton, type RunSendMode } from './run-send.tsx'
+import { PhotoPickerButton } from './photo-picker.tsx'
 
 /** 官方类型的最小本地声明（构建零 @deepseek-ai 依赖）。
  *
@@ -2465,6 +2466,15 @@ export function apply(ctx: any): void {
       }
     },
   }, RunSendButton))
+
+  // 手机端拍/选图（PR：手机发图）：输入栏右侧控件行加一个 📷，选图后合成
+  // drop 交给官方附件管线（与桌面拖图同一路径，零宿主改动）。order 998 落在
+  // 官方发送按钮（999）左侧；与 run-send 按钮同槽位互不干扰。
+  slots.inject('conversation.input.right', () => slots.register({
+    name: 'conversation.input.right',
+    id: 'meow-smooth-photo',
+    order: 998,
+  }, PhotoPickerButton))
 
   // 打包挂 window：下一次模块执行（热替换/rev 更新）在入口调用，拆除本
   // 实例全部运行期资源（见 apply 入口注释）。单项失败不阻断其余拆除。
